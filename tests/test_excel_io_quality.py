@@ -3,7 +3,9 @@ from io import BytesIO
 from openpyxl import Workbook
 
 from excel_merger.excel_io import list_sheet_names, stream_sheet
-from excel_merger.quality import analyze_quality
+import pyarrow as pa
+
+from excel_merger.quality import analyze_quality, arrow_safe_preview, style_preview
 
 
 def workbook_bytes() -> bytes:
@@ -53,3 +55,14 @@ def test_quality_report_finds_missing_and_inconsistent_cells() -> None:
     assert report.mixed_type_columns == 1
     assert report.inconsistent_cells == {(1, "Unnamed_4")}
     assert len(report.header_changes) == 2
+
+
+def test_mixed_numeric_and_text_scores_are_safe_for_streamlit_preview() -> None:
+    loaded = stream_sheet(workbook_bytes(), "customers.xlsx", "Customers", header_row=2)
+    report = analyze_quality(loaded)
+    preview = arrow_safe_preview(loaded.dataframe)
+
+    assert str(preview["Unnamed_4"].dtype) == "string"
+    assert preview["Unnamed_4"].tolist() == ["north", "99", "south"]
+    assert pa.Table.from_pandas(preview) is not None
+    assert str(style_preview(loaded.dataframe, report).data["Unnamed_4"].dtype) == "string"

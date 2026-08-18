@@ -21,7 +21,16 @@ from excel_merger.final_result import (
     prepare_final_result,
 )
 from excel_merger.merge import LookupSpec, MatchOptions, default_prefix, merge_lookups
-from excel_merger.quality import QualityReport, analyze_quality, is_missing, style_preview
+from excel_merger.quality import (
+    QualityReport,
+    analyze_quality,
+    arrow_safe_preview,
+    is_missing,
+    style_preview,
+)
+
+
+FINAL_RESULT_CACHE_VERSION = 2
 
 
 st.set_page_config(
@@ -149,7 +158,7 @@ def render_quality_summary(report: QualityReport) -> None:
         if not quality_frame.empty:
             st.dataframe(
                 quality_frame,
-                width="stretch",
+                use_container_width=True,
                 hide_index=True,
                 column_config={
                     "Missing %": st.column_config.ProgressColumn(
@@ -289,7 +298,7 @@ def render_file_tab(record: dict[str, Any], is_base: bool) -> dict[str, Any] | N
     )
     st.dataframe(
         style_preview(dataframe, report, key_column=key_column),
-        width="stretch",
+        use_container_width=True,
         height=390,
     )
     if len(dataframe) > 200:
@@ -328,7 +337,7 @@ def generation_fingerprint(
 
 
 def merged_style(dataframe: pd.DataFrame) -> pd.io.formats.style.Styler:
-    preview = dataframe.head(200)
+    preview = arrow_safe_preview(dataframe.head(200))
     styles = pd.DataFrame("", index=preview.index, columns=preview.columns)
     for row_index in preview.index:
         for column in preview.columns:
@@ -354,12 +363,20 @@ def render_result(generated: dict[str, Any], output_name: str) -> None:
     coverage = matched / (matched + unmatched) if matched + unmatched else 0.0
     metrics[3].metric("Lookup coverage", f"{coverage:.1%}")
 
-    st.dataframe(merged_style(result.dataframe), width="stretch", height=390)
+    st.dataframe(
+        merged_style(result.dataframe),
+        use_container_width=True,
+        height=390,
+    )
     if len(result.dataframe) > 200:
         st.caption(f"Previewing the first 200 of {len(result.dataframe):,} output rows.")
 
     with st.expander("Lookup audit", expanded=True):
-        st.dataframe(result.audit_frame(), width="stretch", hide_index=True)
+        st.dataframe(
+            result.audit_frame(),
+            use_container_width=True,
+            hide_index=True,
+        )
 
     st.download_button(
         "Download Excel workbook",
@@ -367,7 +384,7 @@ def render_result(generated: dict[str, Any], output_name: str) -> None:
         file_name=clean_output_filename(output_name),
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary",
-        width="stretch",
+        use_container_width=True,
         help="Includes Merged Data, Lookup Audit, and Data Quality worksheets.",
     )
 
@@ -376,7 +393,7 @@ def render_result(generated: dict[str, Any], output_name: str) -> None:
         "Continue with the merged data to calculate totals, grades, grade points, "
         "status, and a course summary."
     )
-    if st.button("Proceed to final result", width="stretch"):
+    if st.button("Proceed to final result", use_container_width=True):
         st.session_state["active_page"] = "final_result"
         st.session_state.pop("generated_final_result", None)
         st.rerun()
@@ -393,7 +410,13 @@ def _suggest_column(columns: list[str], phrases: list[str], fallback: int = 0) -
     for phrase in phrases:
         expected = _normalized_column_name(phrase)
         for column in columns:
-            if expected and expected in normalized[column]:
+            candidate = normalized[column]
+            matches = (
+                expected in candidate
+                if " " in expected
+                else expected in candidate.split()
+            )
+            if expected and matches:
                 return column
     return columns[min(fallback, len(columns) - 1)]
 
@@ -406,6 +429,7 @@ def _final_result_fingerprint(
     details: FinalResultDetails,
 ) -> str:
     payload = {
+        "cache_version": FINAL_RESULT_CACHE_VERSION,
         "source": source_fingerprint,
         "identifier": identifier_column,
         "ca": ca_column,
@@ -416,7 +440,7 @@ def _final_result_fingerprint(
 
 
 def final_result_style(dataframe: pd.DataFrame) -> pd.io.formats.style.Styler:
-    preview = dataframe.head(200)
+    preview = arrow_safe_preview(dataframe.head(200))
     styles = pd.DataFrame("", index=preview.index, columns=preview.columns)
     for row_index in preview.index:
         for column in preview.columns:
@@ -472,12 +496,12 @@ def render_final_result_page() -> None:
     )
     ca_suggestion = _suggest_column(
         score_columns,
-        ["ca score", "continuous assessment", "test score", "assessment score"],
+        ["ca score", "continuous assessment", "test score", "assessment score", "ca", "test"],
         fallback=1,
     )
     exam_suggestion = _suggest_column(
         score_columns,
-        ["exam score", "examination score", "final exam"],
+        ["exam score", "examination score", "final exam", "exam"],
         fallback=2,
     )
     mapping_columns = st.columns(3)
@@ -502,6 +526,11 @@ def render_final_result_page() -> None:
             index=score_columns.index(exam_suggestion),
             key=f"final_exam_{key_suffix}",
         )
+    st.caption(
+        "CA and Exam are suggested from column names only. The base file is not "
+        "automatically treated as the Exam file. Confirm both selections before "
+        "creating the final result."
+    )
 
     st.markdown('<div class="step-label">STEP 2 · ENTER COURSE DETAILS</div>', unsafe_allow_html=True)
     st.subheader("Add the information that belongs on the mark sheet")
@@ -514,7 +543,11 @@ def render_final_result_page() -> None:
                 placeholder="For example, 2025/2026",
                 key=f"session_{key_suffix}",
             )
-            semester = st.text_input("Semester", key=f"semester_{key_suffix}")
+            semester = st.selectbox(
+                "Semester",
+                ["Harmattan", "Rain"],
+                key=f"semester_{key_suffix}",
+            )
         with detail_columns[1]:
             course_code = st.text_input("Course code", key=f"course_code_{key_suffix}")
             course_title = st.text_input("Course title", key=f"course_title_{key_suffix}")
@@ -529,9 +562,9 @@ def render_final_result_page() -> None:
                 )
             )
         with detail_columns[2]:
-            course_status = st.text_input(
+            course_status = st.selectbox(
                 "Course status",
-                placeholder="For example, Core or Elective",
+                ["Core", "Elective", "Required"],
                 key=f"course_status_{key_suffix}",
             )
             lecturers = st.text_input("Lecturer(s)", key=f"lecturers_{key_suffix}")
@@ -654,7 +687,7 @@ def render_final_result_page() -> None:
     if st.button(
         "Create final result workbook",
         type="primary",
-        width="stretch",
+        use_container_width=True,
         disabled=bool(validation_errors),
     ):
         try:
@@ -678,12 +711,20 @@ def render_final_result_page() -> None:
     final_generated = st.session_state.get("generated_final_result")
     if final_generated and final_generated.get("fingerprint") == fingerprint:
         processed = final_generated["processed"]
+        missing_ca_count = int(getattr(processed, "missing_ca_count", 0))
+        missing_exam_count = int(getattr(processed, "missing_exam_count", 0))
         st.markdown("### Final result preview")
         metrics = st.columns(4)
         metrics[0].metric("Records", f"{processed.total_count:,}")
         metrics[1].metric("Passes", f"{processed.pass_count:,}")
         metrics[2].metric("Fails", f"{processed.fail_count:,}")
         metrics[3].metric("Incomplete", f"{processed.incomplete_count:,}")
+        if missing_ca_count or missing_exam_count:
+            st.info(
+                f"{missing_ca_count:,} blank CA values and "
+                f"{missing_exam_count:,} blank exam values were changed to 0. "
+                "The Student Status column identifies the missing score."
+            )
         if processed.invalid_ca_count or processed.invalid_exam_count:
             st.warning(
                 f"{processed.invalid_ca_count:,} CA values and "
@@ -692,7 +733,7 @@ def render_final_result_page() -> None:
             )
         st.dataframe(
             final_result_style(processed.dataframe),
-            width="stretch",
+            use_container_width=True,
             height=420,
         )
         grade_frame = pd.DataFrame(
@@ -708,7 +749,7 @@ def render_final_result_page() -> None:
             file_name=clean_output_filename(final_filename),
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary",
-            width="stretch",
+            use_container_width=True,
         )
     elif final_generated:
         st.info("The final-result settings changed. Create the workbook again to refresh it.")
@@ -832,7 +873,7 @@ def main() -> None:
     create_clicked = st.button(
         "Create merged workbook",
         type="primary",
-        width="stretch",
+        use_container_width=True,
         disabled=bool(missing_returns),
     )
     if create_clicked:

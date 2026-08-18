@@ -15,6 +15,8 @@ from typing import Any
 import pandas as pd
 from openpyxl import Workbook, load_workbook
 from openpyxl.chart import BarChart, Reference
+from openpyxl.chart.label import DataLabelList
+from openpyxl.chart.shapes import GraphicalProperties
 from openpyxl.formatting.rule import FormulaRule
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.worksheet.table import Table, TableStyleInfo
@@ -22,17 +24,20 @@ from openpyxl.worksheet.table import Table, TableStyleInfo
 from .quality import is_missing
 
 
-NAVY = "17324D"
-BLUE = "2563EB"
-LIGHT_BLUE = "DBEAFE"
+# Reference-workbook palette. The pale beige and dark brown combination keeps
+# the generated mark sheet visually consistent with the supplied template.
+TEMPLATE_BEIGE = "EEECE1"
+TEMPLATE_BROWN = "663300"
+GRADE_GREEN = "548235"
+GRADE_DARK_GREEN = "375623"
+GRADE_LIGHT_GREEN = "E2F0D9"
 PALE_GREEN = "DCFCE7"
 PALE_RED = "FEE2E2"
 PALE_AMBER = "FEF3C7"
-PALE_GRAY = "F8FAFC"
 WHITE = "FFFFFF"
-TEXT = "172033"
-MUTED = "64748B"
-BORDER_COLOR = "CBD5E1"
+TEXT = "000000"
+MUTED = TEMPLATE_BROWN
+BORDER_COLOR = "D9D1C5"
 
 
 @dataclass(frozen=True)
@@ -122,6 +127,8 @@ class ProcessedFinalResult:
     pass_count: int
     fail_count: int
     incomplete_count: int
+    missing_ca_count: int
+    missing_exam_count: int
     invalid_ca_count: int
     invalid_exam_count: int
 
@@ -145,12 +152,43 @@ def _clean_identifier(value: Any) -> str | None:
     return text or None
 
 
-def _numeric_scores(series: pd.Series, maximum: float) -> tuple[pd.Series, pd.Series]:
+def _score_is_missing(value: Any) -> bool:
+    return is_missing(value) or (isinstance(value, str) and not value.strip())
+
+
+def _numeric_scores(
+    series: pd.Series,
+    maximum: float,
+) -> tuple[pd.Series, pd.Series, pd.Series]:
     numeric = pd.to_numeric(series, errors="coerce")
-    source_has_value = series.map(lambda value: not is_missing(value))
+    missing = series.map(_score_is_missing)
+    source_has_value = ~missing
     invalid = source_has_value & (numeric.isna() | (numeric < 0) | (numeric > maximum))
-    clean = numeric.mask(invalid)
-    return clean.astype("Float64"), invalid
+    clean = numeric.mask(missing, 0).mask(invalid)
+    return clean.astype("Float64"), invalid, missing
+
+
+def _incomplete_status(
+    ca_missing: bool,
+    exam_missing: bool,
+    ca_invalid: bool,
+    exam_invalid: bool,
+) -> str | None:
+    if ca_missing and exam_missing:
+        return "Incomplete: Missing CA and Exam"
+    if ca_invalid and exam_invalid:
+        return "Incomplete: Invalid CA and Exam"
+
+    issues: list[str] = []
+    if ca_missing:
+        issues.append("Missing CA")
+    elif ca_invalid:
+        issues.append("Invalid CA")
+    if exam_missing:
+        issues.append("Missing Exam")
+    elif exam_invalid:
+        issues.append("Invalid Exam")
+    return f"Incomplete: {' and '.join(issues)}" if issues else None
 
 
 def prepare_final_result(
@@ -172,29 +210,46 @@ def prepare_final_result(
     if len(set(selected)) != 3:
         raise ValueError("Identifier, CA score, and exam score must use different columns.")
 
-    ca_scores, invalid_ca = _numeric_scores(
+    ca_scores, invalid_ca, missing_ca = _numeric_scores(
         merged_dataframe[ca_column], details.maximum_ca_score
     )
-    exam_scores, invalid_exam = _numeric_scores(
+    exam_scores, invalid_exam, missing_exam = _numeric_scores(
         merged_dataframe[exam_column], details.maximum_exam_score
     )
     identifiers = merged_dataframe[identifier_column].map(_clean_identifier)
-    complete = ca_scores.notna() & exam_scores.notna()
-    totals = (ca_scores + exam_scores).where(complete)
+    scores_are_valid = ca_scores.notna() & exam_scores.notna()
+    totals = (ca_scores + exam_scores).where(scores_are_valid)
 
     grades: list[str | None] = []
     grade_points: list[int | None] = []
     statuses: list[str] = []
-    for is_complete, total in zip(complete.tolist(), totals.tolist(), strict=True):
-        if not is_complete or is_missing(total):
+    row_states = zip(
+        totals.tolist(),
+        missing_ca.tolist(),
+        missing_exam.tolist(),
+        invalid_ca.tolist(),
+        invalid_exam.tolist(),
+        strict=True,
+    )
+    for total, ca_is_missing, exam_is_missing, ca_is_invalid, exam_is_invalid in row_states:
+        issue_status = _incomplete_status(
+            bool(ca_is_missing),
+            bool(exam_is_missing),
+            bool(ca_is_invalid),
+            bool(exam_is_invalid),
+        )
+        if is_missing(total):
             grades.append(None)
             grade_points.append(None)
-            statuses.append("Incomplete")
+            statuses.append(issue_status or "Incomplete")
             continue
         grade, point = details.grade_scale.grade_for(float(total))
         grades.append(grade)
         grade_points.append(point)
-        statuses.append("Pass" if float(total) >= details.grade_scale.pass_mark else "Fail")
+        statuses.append(
+            issue_status
+            or ("Pass" if float(total) >= details.grade_scale.pass_mark else "Fail")
+        )
 
     result = pd.DataFrame(
         {
@@ -216,7 +271,9 @@ def prepare_final_result(
         grade_counts=grade_counts,
         pass_count=statuses.count("Pass"),
         fail_count=statuses.count("Fail"),
-        incomplete_count=statuses.count("Incomplete"),
+        incomplete_count=sum(status.startswith("Incomplete") for status in statuses),
+        missing_ca_count=int(missing_ca.sum()),
+        missing_exam_count=int(missing_exam.sum()),
         invalid_ca_count=int(invalid_ca.sum()),
         invalid_exam_count=int(invalid_exam.sum()),
     )
@@ -246,12 +303,23 @@ def _fill(color: str) -> PatternFill:
     return PatternFill("solid", fgColor=color)
 
 
-def _apply_section_header(worksheet: Any, cell_range: str, title: str) -> None:
+def _apply_section_header(
+    worksheet: Any,
+    cell_range: str,
+    title: str,
+    fill_color: str = TEMPLATE_BEIGE,
+    font_color: str = TEMPLATE_BROWN,
+) -> None:
     worksheet.merge_cells(cell_range)
     cell = worksheet[cell_range.split(":", 1)[0]]
     cell.value = title
-    cell.fill = _fill(NAVY)
-    cell.font = Font(name="Aptos Display", size=12, bold=True, color=WHITE)
+    cell.fill = _fill(fill_color)
+    cell.font = Font(
+        name="Aptos Display",
+        size=12,
+        bold=True,
+        color=font_color,
+    )
     cell.alignment = Alignment(horizontal="left", vertical="center")
 
 
@@ -260,11 +328,16 @@ def _build_settings_sheet(
     details: FinalResultDetails,
 ) -> Any:
     worksheet = workbook.create_sheet("Settings")
-    worksheet.sheet_view.showGridLines = False
+    worksheet.sheet_view.showGridLines = True
     worksheet.merge_cells("A1:D1")
     worksheet["A1"] = "Final Result Settings"
-    worksheet["A1"].fill = _fill(NAVY)
-    worksheet["A1"].font = Font(name="Aptos Display", size=16, bold=True, color=WHITE)
+    worksheet["A1"].fill = _fill(TEMPLATE_BEIGE)
+    worksheet["A1"].font = Font(
+        name="Aptos Display",
+        size=16,
+        bold=True,
+        color=TEMPLATE_BROWN,
+    )
     worksheet["A1"].alignment = Alignment(vertical="center")
     worksheet.row_dimensions[1].height = 30
 
@@ -285,8 +358,8 @@ def _build_settings_sheet(
 
     worksheet.merge_cells("A13:D13")
     worksheet["A13"] = "Score Settings"
-    worksheet["A13"].fill = _fill(BLUE)
-    worksheet["A13"].font = Font(name="Aptos", bold=True, color=WHITE)
+    worksheet["A13"].fill = _fill(TEMPLATE_BEIGE)
+    worksheet["A13"].font = Font(name="Aptos", bold=True, color=TEMPLATE_BROWN)
     score_rows = [
         ("Maximum CA Score", details.maximum_ca_score),
         ("Maximum Exam Score", details.maximum_exam_score),
@@ -298,13 +371,13 @@ def _build_settings_sheet(
 
     worksheet.merge_cells("A18:D18")
     worksheet["A18"] = "Grading Scale"
-    worksheet["A18"].fill = _fill(BLUE)
-    worksheet["A18"].font = Font(name="Aptos", bold=True, color=WHITE)
+    worksheet["A18"].fill = _fill(GRADE_LIGHT_GREEN)
+    worksheet["A18"].font = Font(name="Aptos", bold=True, color=GRADE_DARK_GREEN)
     worksheet.append([])
     for column, value in enumerate(["Grade", "Minimum Total", "Grade Point"], start=1):
         cell = worksheet.cell(19, column, value)
-        cell.fill = _fill(LIGHT_BLUE)
-        cell.font = Font(name="Aptos", bold=True, color=TEXT)
+        cell.fill = _fill(GRADE_LIGHT_GREEN)
+        cell.font = Font(name="Aptos", bold=True, color=GRADE_DARK_GREEN)
     grade_rows = [
         ("A", details.grade_scale.a_minimum, 5),
         ("B", details.grade_scale.b_minimum, 4),
@@ -345,13 +418,17 @@ def _build_final_sheet(
     details: FinalResultDetails,
 ) -> Any:
     worksheet = workbook.create_sheet("Final Result", 0)
-    worksheet.sheet_view.showGridLines = False
-    worksheet.freeze_panes = "A40"
+    worksheet.sheet_view.showGridLines = True
 
     worksheet.merge_cells("A1:H1")
     worksheet["A1"] = "MARK SHEET"
-    worksheet["A1"].fill = _fill(NAVY)
-    worksheet["A1"].font = Font(name="Aptos Display", size=18, bold=True, color=WHITE)
+    worksheet["A1"].fill = _fill(TEMPLATE_BEIGE)
+    worksheet["A1"].font = Font(
+        name="Aptos Display",
+        size=18,
+        bold=True,
+        color=TEMPLATE_BROWN,
+    )
     worksheet["A1"].alignment = Alignment(horizontal="center", vertical="center")
     worksheet.row_dimensions[1].height = 34
 
@@ -373,12 +450,28 @@ def _build_final_sheet(
         worksheet.cell(row_number, 2).font = Font(name="Aptos", color=TEXT)
         worksheet.cell(row_number, 2).alignment = Alignment(wrap_text=True)
 
-    _apply_section_header(worksheet, "A12:H12", "Executive Summary")
+    # Keep the numeric credit-unit value visible even in spreadsheet viewers
+    # that do not calculate formulas when the workbook is first opened.
+    worksheet["B8"] = details.credit_units
+    worksheet["B8"].number_format = "0"
+    worksheet["B8"].alignment = Alignment(
+        horizontal="left",
+        vertical="center",
+        wrap_text=True,
+    )
+
+    _apply_section_header(
+        worksheet,
+        "A12:H12",
+        "Executive Summary",
+        fill_color=GRADE_LIGHT_GREEN,
+        font_color=GRADE_DARK_GREEN,
+    )
     summary_headers = ["Grades", "A", "B", "C", "D", "E", "F", "Total Records"]
     for column_number, value in enumerate(summary_headers, start=1):
         cell = worksheet.cell(13, column_number, value)
-        cell.fill = _fill(LIGHT_BLUE)
-        cell.font = Font(name="Aptos", bold=True, color=TEXT)
+        cell.fill = _fill(GRADE_LIGHT_GREEN)
+        cell.font = Font(name="Aptos", bold=True, color=GRADE_DARK_GREEN)
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
     data_start = 40
@@ -398,7 +491,7 @@ def _build_final_sheet(
     stats = [
         ("A17", "Number of passes", "B17", f'=COUNTIF($H${data_start}:$H${data_range_end},"Pass")'),
         ("C17", "Number of fails", "D17", f'=COUNTIF($H${data_start}:$H${data_range_end},"Fail")'),
-        ("E17", "Incomplete records", "F17", f'=COUNTIF($H${data_start}:$H${data_range_end},"Incomplete")'),
+        ("E17", "Incomplete records", "F17", f'=COUNTIF($H${data_start}:$H${data_range_end},"Incomplete*")'),
         ("G17", "Pass rate", "H17", "=IF((B17+D17)=0,0,B17/(B17+D17))"),
     ]
     for label_cell, label, value_cell, formula in stats:
@@ -409,15 +502,32 @@ def _build_final_sheet(
 
     chart = BarChart()
     chart.type = "col"
-    chart.style = 10
-    chart.title = "Grade Distribution"
-    chart.y_axis.title = "Number of records"
-    chart.x_axis.title = "Grade"
-    chart.height = 6.5
-    chart.width = 14.5
+    chart.varyColors = False
+    chart.y_axis.scaling.min = 0
+    chart.y_axis.scaling.max = 1
+    chart.y_axis.numFmt = "0%"
+    chart.y_axis.delete = True
+    chart.y_axis.majorGridlines = None
+    chart.height = 4.8
+    chart.width = 15.5
+    chart.gapWidth = 250
     chart.legend = None
-    chart.add_data(Reference(worksheet, min_col=2, max_col=7, min_row=14), from_rows=True)
+    chart.graphical_properties = GraphicalProperties(noFill=True)
+    chart.graphical_properties.line.noFill = True
+    chart.add_data(Reference(worksheet, min_col=2, max_col=7, min_row=15), from_rows=True)
     chart.set_categories(Reference(worksheet, min_col=2, max_col=7, min_row=13))
+    chart.series[0].graphicalProperties.solidFill = GRADE_GREEN
+    chart.series[0].graphicalProperties.line.solidFill = GRADE_GREEN
+    chart.dLbls = DataLabelList()
+    chart.dLbls.showVal = True
+    chart.dLbls.showLegendKey = False
+    chart.dLbls.showCatName = False
+    chart.dLbls.showSerName = False
+    chart.dLbls.showPercent = False
+    chart.dLbls.showBubbleSize = False
+    chart.dLbls.showLeaderLines = False
+    chart.dLbls.numFmt = "0.0%"
+    chart.dLbls.dLblPos = "outEnd"
     worksheet.add_chart(chart, "B19")
 
     _apply_section_header(worksheet, "A33:H33", "Lecturer's Remarks")
@@ -426,7 +536,13 @@ def _build_final_sheet(
     worksheet["A34"].alignment = Alignment(vertical="top", wrap_text=True)
     worksheet.row_dimensions[34].height = 38
 
-    _apply_section_header(worksheet, "A36:H36", "Main Result")
+    _apply_section_header(
+        worksheet,
+        "A36:H36",
+        "Main Result",
+        fill_color=GRADE_LIGHT_GREEN,
+        font_color=GRADE_DARK_GREEN,
+    )
     worksheet["A37"] = "Maximum CA score"
     worksheet["B37"] = "=Settings!B14"
     worksheet["D37"] = "Maximum exam score"
@@ -439,10 +555,10 @@ def _build_final_sheet(
     headers = list(processed.dataframe.columns)
     for column_number, value in enumerate(headers, start=1):
         cell = worksheet.cell(39, column_number, value)
-        cell.fill = _fill(BLUE)
-        cell.font = Font(name="Aptos", size=10, bold=True, color=WHITE)
+        cell.fill = _fill(GRADE_LIGHT_GREEN)
+        cell.font = Font(name="Aptos", size=10, bold=True, color=GRADE_DARK_GREEN)
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    worksheet.row_dimensions[39].height = 42
+    worksheet.row_dimensions[39].height = 54
 
     thin = Side(style="thin", color=BORDER_COLOR)
     for zero_index, row in processed.dataframe.iterrows():
@@ -474,33 +590,33 @@ def _build_final_sheet(
                 f'IF(E{row_number}>=Settings!$B$23,2,IF(E{row_number}>=Settings!$B$24,1,0))))))'
             ),
         )
-        worksheet.cell(
-            row_number,
-            8,
-            (
-                f'=IF(E{row_number}="","Incomplete",'
-                f'IF(E{row_number}>=Settings!$B$16,"Pass","Fail"))'
-            ),
-        )
+        preview_status = str(row["Student Status"])
+        if preview_status.startswith("Incomplete"):
+            _set_literal(worksheet.cell(row_number, 8), preview_status)
+        else:
+            worksheet.cell(
+                row_number,
+                8,
+                f'=IF(E{row_number}>=Settings!$B$16,"Pass","Fail")',
+            )
         for column_number in range(1, 9):
             cell = worksheet.cell(row_number, column_number)
+            cell.fill = _fill(
+                GRADE_LIGHT_GREEN if row_number % 2 == 0 else WHITE
+            )
             cell.border = Border(bottom=thin)
             cell.font = Font(name="Aptos", size=10, color=TEXT)
             cell.alignment = Alignment(
                 horizontal="left" if column_number == 2 else "center",
                 vertical="center",
             )
-        if row_number % 2 == 0:
-            for column_number in range(1, 9):
-                worksheet.cell(row_number, column_number).fill = _fill(PALE_GRAY)
-
     if len(processed.dataframe):
         table = Table(displayName="FinalResultTable", ref=f"A39:H{data_end}")
         table.tableStyleInfo = TableStyleInfo(
-            name="TableStyleMedium2",
+            name="TableStyleLight1",
             showFirstColumn=False,
             showLastColumn=False,
-            showRowStripes=True,
+            showRowStripes=False,
             showColumnStripes=False,
         )
         worksheet.add_table(table)
@@ -524,16 +640,18 @@ def _build_final_sheet(
         worksheet.conditional_formatting.add(
             status_range,
             FormulaRule(
-                formula=[f'$H{data_start}="Incomplete"'],
+                formula=[f'LEFT($H{data_start},10)="Incomplete"'],
                 fill=_fill(PALE_AMBER),
                 font=Font(color="92400E"),
             ),
         )
 
-    widths = [9, 24, 15, 15, 16, 15, 14, 18]
+    widths = [9, 24, 15, 15, 16, 15, 14, 32]
     for column_number, width in enumerate(widths, start=1):
         worksheet.column_dimensions[chr(64 + column_number)].width = width
-    worksheet.auto_filter.ref = f"A39:H{data_range_end}"
+    # The Excel table already supplies its own filter. Adding a worksheet-level
+    # filter over the same cells creates two overlapping filter definitions,
+    # which desktop Excel treats as damaged workbook content.
     worksheet.print_area = f"A1:H{data_range_end}"
     worksheet.print_title_rows = "39:39"
     worksheet.page_setup.orientation = "landscape"
@@ -579,9 +697,33 @@ def inspect_final_result_workbook(content: bytes) -> dict[str, Any]:
             "first_total_formula": result["E40"].value,
             "first_grade_formula": result["F40"].value,
             "settings_title": settings["A1"].value,
+            "settings_credit_units": settings["B8"].value,
+            "visible_credit_units": result["B8"].value,
+            "visible_credit_units_alignment": result["B8"].alignment.horizontal,
             "chart_count": len(result._charts),
             "table_count": len(result.tables),
+            "worksheet_filter": result.auto_filter.ref,
             "freeze_panes": result.freeze_panes,
+            "header_fill": result["A39"].fill.fgColor.rgb,
+            "header_font_color": result["A39"].font.color.rgb,
+            "table_style": result.tables["FinalResultTable"].tableStyleInfo.name,
+            "chart_series_fill": (
+                result._charts[0]
+                .series[0]
+                .graphicalProperties.solidFill.srgbClr
+            ),
+            "chart_values_reference": result._charts[0].series[0].val.numRef.f,
+            "chart_data_labels": result._charts[0].dLbls.showVal,
+            "chart_data_label_format": result._charts[0].dLbls.numFmt,
+            "chart_title": result._charts[0].title,
+            "chart_legend": result._charts[0].legend,
+            "chart_y_axis_hidden": result._charts[0].y_axis.delete,
+            "chart_gridlines": result._charts[0].y_axis.majorGridlines,
+            "chart_gap_width": result._charts[0].gapWidth,
+            "chart_shows_series_name": result._charts[0].dLbls.showSerName,
+            "chart_shows_category_name": result._charts[0].dLbls.showCatName,
+            "first_data_row_fill": result["A40"].fill.fgColor.rgb,
+            "second_data_row_fill": result["A41"].fill.fgColor.rgb,
         }
     finally:
         workbook.close()

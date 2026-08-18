@@ -8,6 +8,7 @@ from numbers import Number
 from typing import Any
 
 import pandas as pd
+from pandas.api.types import is_object_dtype
 
 from .excel_io import LoadedSheet
 
@@ -155,6 +156,27 @@ def analyze_quality(loaded: LoadedSheet) -> QualityReport:
     )
 
 
+def arrow_safe_preview(dataframe: pd.DataFrame) -> pd.DataFrame:
+    """Return a display-only frame with Arrow-compatible object columns.
+
+    Excel commonly stores numeric scores and text markers such as ``ABS`` in
+    the same column. Pandas correctly represents that data as ``object``, but
+    PyArrow attempts to force the text marker into the inferred numeric type
+    when Streamlit renders the preview. Converting object columns to pandas'
+    nullable string dtype prevents the serialization warning without changing
+    the source DataFrame used for matching or export.
+    """
+
+    preview = dataframe.copy()
+    for column in preview.columns:
+        if not is_object_dtype(preview[column].dtype):
+            continue
+        preview[column] = preview[column].map(
+            lambda value: pd.NA if is_missing(value) else str(value)
+        ).astype("string")
+    return preview
+
+
 def style_preview(
     dataframe: pd.DataFrame,
     report: QualityReport,
@@ -163,7 +185,7 @@ def style_preview(
 ) -> pd.io.formats.style.Styler:
     """Return a compact Styler with visible quality warnings."""
 
-    preview = dataframe.head(max_rows)
+    preview = arrow_safe_preview(dataframe.head(max_rows))
     styles = pd.DataFrame("", index=preview.index, columns=preview.columns)
 
     for row_index in preview.index:

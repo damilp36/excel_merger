@@ -251,15 +251,22 @@ workbook does not need to be uploaded again.
 On the final result page:
 
 1. Select the student identifier, CA score, and exam score columns.
-2. Enter the programme, session, semester, course code, course title, credit
-   units, course status, lecturer names, and optional remarks.
+2. Enter the programme, session, course code, course title, credit units,
+   lecturer names, and optional remarks. Select Harmattan or Rain for the
+   semester, then select Core, Elective, or Required for the course status.
 3. Confirm the maximum CA and exam scores.
 4. Confirm the pass mark and grade boundaries.
 5. Create the final result workbook and review the calculated preview.
 6. Download the final result workbook using the filename you provide.
 
-Values that are missing, non-numeric, negative, or above the selected maximum
-score are treated as incomplete. They are not assigned a grade until corrected.
+The app suggests CA and Exam columns from their column names. It does not assume
+that the base file is the Exam file. Review both dropdown selections before
+creating the final result.
+
+A blank CA or Exam score is converted to `0`. The total and grade are still
+calculated, while Student Status identifies whether CA, Exam, or both were
+missing. Non-numeric, negative, and above-maximum scores remain invalid and are
+not assigned a grade until corrected.
 
 ## Understanding the final result workbook
 
@@ -277,6 +284,11 @@ This is the printable mark sheet. It includes:
 - A grade-distribution chart
 - Lecturer remarks
 - The complete result table
+
+The sheet uses a light beige and dark brown colour scheme for general sections,
+with green grade summaries, a solid green chart, and alternating white and
+light-green result rows. It opens without a large frozen summary section, so
+the result table scrolls normally.
 
 The result table contains the serial number, selected student identifier, CA
 score, exam score, grand total, grade letter, grade point, and student status.

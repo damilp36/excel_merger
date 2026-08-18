@@ -257,7 +257,10 @@ On the final result page:
 3. Confirm the maximum CA and exam scores.
 4. Confirm the pass mark and grade boundaries.
 5. Create the final result workbook and review the calculated preview.
-6. Download the final result workbook using the filename you provide.
+6. Correct any CA or Exam values in the editable score table and select
+   **Apply score edits**. Totals, grades, statuses, summaries, and the workbook
+   are recalculated automatically.
+7. Download the final result workbook using the filename you provide.
 
 The app suggests CA and Exam columns from their column names. It does not assume
 that the base file is the Exam file. Review both dropdown selections before
@@ -267,6 +270,40 @@ A blank CA or Exam score is converted to `0`. The total and grade are still
 calculated, while Student Status identifies whether CA, Exam, or both were
 missing. Non-numeric, negative, and above-maximum scores remain invalid and are
 not assigned a grade until corrected.
+
+Only the CA Score and Exam Score columns can be changed in the review table.
+Calculated and identifying columns are locked. If a score has been edited, the
+download remains disabled until the edits have been applied.
+
+The **Add marks in bulk** panel can add the same number of marks to either CA
+or Exam. The adjustment can target all records or only students currently in a
+selected grade group from A through F. Scores are capped at the configured
+maximum. Missing and invalid target scores are skipped by default, with an
+option to include missing scores as values starting from zero.
+
+## Updating an existing result workbook
+
+An existing result workbook can be updated without repeating the lookup. On the
+main page, open **Update an existing result workbook** and upload an `.xlsx`,
+`.xlsm`, or `.xls` file.
+
+If the workbook was created by this app, select **Open final result for
+editing**. The app restores its course details, score limits, grade boundaries,
+student scores, and missing or invalid score statuses automatically.
+
+For any other Excel workbook:
+
+1. Select the worksheet containing the result records.
+2. Enter the row containing the column headers.
+3. Review the streamed preview and data-quality report.
+4. Select **Open worksheet and map result columns**.
+5. Choose the student identifier, CA score, and Exam score columns.
+6. Enter or confirm the course details and grading rules.
+7. Create, review, edit, and download the updated final-result workbook.
+
+The same individual score editor and bulk mark adjustment tools are available
+for both types of workbook. The updated download uses the latest workbook
+formatting and formulas.
 
 ## Understanding the final result workbook
 

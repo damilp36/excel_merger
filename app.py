@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import asdict
+from numbers import Number
 from pathlib import Path
 import re
 from typing import Any
@@ -16,11 +17,22 @@ from excel_merger.excel_io import LoadedSheet, WorkbookReadError, list_sheet_nam
 from excel_merger.exporter import ExportLimitError, build_output_workbook, clean_output_filename
 from excel_merger.final_result import (
     FinalResultDetails,
+    FinalResultWorkbookError,
     GradeScale,
+    ImportedFinalResult,
+    apply_bulk_score_adjustment,
     build_final_result_workbook,
+    import_final_result_workbook,
+    prepare_edited_final_result,
     prepare_final_result,
 )
-from excel_merger.merge import LookupSpec, MatchOptions, default_prefix, merge_lookups
+from excel_merger.merge import (
+    LookupSpec,
+    MatchOptions,
+    MergeResult,
+    default_prefix,
+    merge_lookups,
+)
 from excel_merger.quality import (
     QualityReport,
     analyze_quality,
@@ -30,7 +42,7 @@ from excel_merger.quality import (
 )
 
 
-FINAL_RESULT_CACHE_VERSION = 2
+FINAL_RESULT_CACHE_VERSION = 5
 
 
 st.set_page_config(
@@ -59,6 +71,11 @@ def cached_sheet(
 @st.cache_data(show_spinner=False, max_entries=32)
 def cached_quality(loaded: LoadedSheet) -> QualityReport:
     return analyze_quality(loaded)
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def cached_final_result_import(content: bytes) -> ImportedFinalResult:
+    return import_final_result_workbook(content)
 
 
 def file_fingerprint(content: bytes) -> str:
@@ -439,6 +456,151 @@ def _final_result_fingerprint(
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 
+def _open_imported_final_result(
+    imported: ImportedFinalResult,
+    content: bytes,
+    file_name: str,
+) -> None:
+    """Seed the existing final-result editor without running a lookup merge."""
+
+    details = imported.details
+    identifier_column = details.identifier_heading.strip()
+    source_fingerprint = f"{file_fingerprint(content)}-generated-final"
+    key_suffix = source_fingerprint[:12]
+    widget_values = {
+        f"final_identifier_{key_suffix}": identifier_column,
+        f"final_ca_{key_suffix}": "CA Score",
+        f"final_exam_{key_suffix}": "Exam Score",
+        f"programme_{key_suffix}": details.programme,
+        f"session_{key_suffix}": details.session,
+        f"semester_{key_suffix}": details.semester,
+        f"course_code_{key_suffix}": details.course_code,
+        f"course_title_{key_suffix}": details.course_title,
+        f"credit_units_{key_suffix}": details.credit_units,
+        f"course_status_{key_suffix}": details.course_status,
+        f"lecturers_{key_suffix}": details.lecturers,
+        f"identifier_heading_{key_suffix}_{identifier_column}": identifier_column,
+        f"remarks_{key_suffix}": details.remarks,
+        f"max_ca_{key_suffix}": float(details.maximum_ca_score),
+        f"max_exam_{key_suffix}": float(details.maximum_exam_score),
+        f"pass_mark_{key_suffix}": float(details.grade_scale.pass_mark),
+        f"grade_a_{key_suffix}": float(details.grade_scale.a_minimum),
+        f"grade_b_{key_suffix}": float(details.grade_scale.b_minimum),
+        f"grade_c_{key_suffix}": float(details.grade_scale.c_minimum),
+        f"grade_d_{key_suffix}": float(details.grade_scale.d_minimum),
+        f"grade_e_{key_suffix}": float(details.grade_scale.e_minimum),
+        f"final_filename_{key_suffix}": clean_output_filename(file_name),
+    }
+    # Keep imported values separate from Streamlit's widget-owned Session State.
+    # Assigning a value to a widget key here and also passing value/index when the
+    # widget is rendered causes Streamlit's competing-defaults warning.
+    for key in widget_values:
+        st.session_state.pop(key, None)
+    st.session_state[f"imported_final_defaults_{key_suffix}"] = widget_values
+
+    rebuilt_workbook = build_final_result_workbook(imported.processed, details)
+    previous_generated = st.session_state.get("generated_final_result") or {}
+    editor_revision = int(previous_generated.get("editor_revision", 0)) + 1
+    fingerprint = _final_result_fingerprint(
+        source_fingerprint,
+        identifier_column,
+        "CA Score",
+        "Exam Score",
+        details,
+    )
+    st.session_state["generated_lookup"] = {
+        "fingerprint": source_fingerprint,
+        "result": MergeResult(
+            imported.source_dataframe,
+            base_rows=len(imported.source_dataframe),
+            base_key=identifier_column,
+        ),
+        "workbook": content,
+        "imported_final_result": True,
+    }
+    st.session_state["generated_final_result"] = {
+        "fingerprint": fingerprint,
+        "processed": imported.processed,
+        "workbook": rebuilt_workbook,
+        "editor_revision": editor_revision,
+    }
+    st.session_state["active_page"] = "final_result"
+
+
+def _open_existing_source_for_mapping(
+    loaded: LoadedSheet,
+    content: bytes,
+) -> None:
+    """Open an ordinary workbook in the final-result column-mapping workflow."""
+
+    dataframe = loaded.dataframe.copy()
+    columns = [str(column) for column in dataframe.columns]
+    if dataframe.empty:
+        raise ValueError("The selected worksheet does not contain any data rows.")
+    if len(columns) < 3:
+        raise ValueError(
+            "The selected worksheet needs at least three columns for the student "
+            "identifier, CA score, and Exam score."
+        )
+
+    fingerprint_payload = (
+        f"{file_fingerprint(content)}:{loaded.sheet_name}:{loaded.header_row}"
+    )
+    source_fingerprint = hashlib.sha256(fingerprint_payload.encode()).hexdigest()
+    key_suffix = source_fingerprint[:12]
+    source_name = Path(loaded.file_name).stem.strip() or "result"
+    st.session_state[f"imported_final_defaults_{key_suffix}"] = {
+        f"final_filename_{key_suffix}": clean_output_filename(
+            f"updated_{source_name}.xlsx"
+        )
+    }
+    st.session_state["generated_lookup"] = {
+        "fingerprint": source_fingerprint,
+        "result": MergeResult(
+            dataframe,
+            base_rows=len(dataframe),
+            base_key=columns[0],
+        ),
+        "workbook": content,
+        "imported_final_result": False,
+        "source_sheet": loaded.sheet_name,
+        "source_header_row": loaded.header_row,
+    }
+    st.session_state.pop("generated_final_result", None)
+    st.session_state["active_page"] = "final_result"
+
+
+def _score_edit_fingerprint(dataframe: pd.DataFrame) -> str:
+    """Return a stable fingerprint for the editable CA and Exam values."""
+
+    values: dict[str, list[float | str | None]] = {}
+    for column in ["CA Score", "Exam Score"]:
+        normalized: list[float | str | None] = []
+        for value in dataframe[column].tolist():
+            if is_missing(value) or (isinstance(value, str) and not value.strip()):
+                normalized.append(None)
+            elif isinstance(value, Number) and not isinstance(value, bool):
+                normalized.append(float(value))
+            else:
+                text = str(value).strip()
+                try:
+                    normalized.append(float(text))
+                except ValueError:
+                    normalized.append(text)
+        values[column] = normalized
+    return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
+
+
+def _final_widget_default(key_suffix: str, key: str, default: Any) -> Any:
+    """Return an imported workbook value without mutating a widget state key."""
+
+    imported_defaults = st.session_state.get(
+        f"imported_final_defaults_{key_suffix}",
+        {},
+    )
+    return imported_defaults.get(key, default)
+
+
 def final_result_style(dataframe: pd.DataFrame) -> pd.io.formats.style.Styler:
     preview = arrow_safe_preview(dataframe.head(200))
     styles = pd.DataFrame("", index=preview.index, columns=preview.columns)
@@ -506,25 +668,55 @@ def render_final_result_page() -> None:
     )
     mapping_columns = st.columns(3)
     with mapping_columns[0]:
+        identifier_key = f"final_identifier_{key_suffix}"
+        identifier_default = _final_widget_default(
+            key_suffix,
+            identifier_key,
+            identifier_suggestion,
+        )
         identifier_column = st.selectbox(
             "Student identifier column",
             columns,
-            index=columns.index(identifier_suggestion),
-            key=f"final_identifier_{key_suffix}",
+            index=(
+                columns.index(identifier_default)
+                if identifier_default in columns
+                else columns.index(identifier_suggestion)
+            ),
+            key=identifier_key,
         )
     with mapping_columns[1]:
+        ca_key = f"final_ca_{key_suffix}"
+        ca_default = _final_widget_default(
+            key_suffix,
+            ca_key,
+            ca_suggestion,
+        )
         ca_column = st.selectbox(
             "CA score column",
             score_columns,
-            index=score_columns.index(ca_suggestion),
-            key=f"final_ca_{key_suffix}",
+            index=(
+                score_columns.index(ca_default)
+                if ca_default in score_columns
+                else score_columns.index(ca_suggestion)
+            ),
+            key=ca_key,
         )
     with mapping_columns[2]:
+        exam_key = f"final_exam_{key_suffix}"
+        exam_default = _final_widget_default(
+            key_suffix,
+            exam_key,
+            exam_suggestion,
+        )
         exam_column = st.selectbox(
             "Exam score column",
             score_columns,
-            index=score_columns.index(exam_suggestion),
-            key=f"final_exam_{key_suffix}",
+            index=(
+                score_columns.index(exam_default)
+                if exam_default in score_columns
+                else score_columns.index(exam_suggestion)
+            ),
+            key=exam_key,
         )
     st.caption(
         "CA and Exam are suggested from column names only. The base file is not "
@@ -537,79 +729,148 @@ def render_final_result_page() -> None:
     with st.container(border=True):
         detail_columns = st.columns(3)
         with detail_columns[0]:
-            programme = st.text_input("Programme", key=f"programme_{key_suffix}")
+            programme_key = f"programme_{key_suffix}"
+            programme = st.text_input(
+                "Programme",
+                value=_final_widget_default(key_suffix, programme_key, ""),
+                key=programme_key,
+            )
+            session_key = f"session_{key_suffix}"
             session = st.text_input(
                 "Session",
+                value=_final_widget_default(key_suffix, session_key, ""),
                 placeholder="For example, 2025/2026",
-                key=f"session_{key_suffix}",
+                key=session_key,
             )
+            semester_key = f"semester_{key_suffix}"
+            semester_options = ["Harmattan", "Rain"]
+            stored_semester = st.session_state.get(
+                semester_key,
+                _final_widget_default(key_suffix, semester_key, "Harmattan"),
+            )
+            if stored_semester and stored_semester not in semester_options:
+                semester_options.insert(0, str(stored_semester))
             semester = st.selectbox(
                 "Semester",
-                ["Harmattan", "Rain"],
-                key=f"semester_{key_suffix}",
+                semester_options,
+                index=(
+                    semester_options.index(stored_semester)
+                    if stored_semester in semester_options
+                    else 0
+                ),
+                key=semester_key,
             )
         with detail_columns[1]:
-            course_code = st.text_input("Course code", key=f"course_code_{key_suffix}")
-            course_title = st.text_input("Course title", key=f"course_title_{key_suffix}")
+            course_code_key = f"course_code_{key_suffix}"
+            course_code = st.text_input(
+                "Course code",
+                value=_final_widget_default(key_suffix, course_code_key, ""),
+                key=course_code_key,
+            )
+            course_title_key = f"course_title_{key_suffix}"
+            course_title = st.text_input(
+                "Course title",
+                value=_final_widget_default(key_suffix, course_title_key, ""),
+                key=course_title_key,
+            )
+            credit_units_key = f"credit_units_{key_suffix}"
             credit_units = int(
                 st.number_input(
                     "Credit units",
                     min_value=0,
                     max_value=30,
-                    value=2,
+                    value=_final_widget_default(
+                        key_suffix,
+                        credit_units_key,
+                        2,
+                    ),
                     step=1,
-                    key=f"credit_units_{key_suffix}",
+                    key=credit_units_key,
                 )
             )
         with detail_columns[2]:
+            course_status_key = f"course_status_{key_suffix}"
+            course_status_options = ["Core", "Elective", "Required"]
+            stored_course_status = st.session_state.get(
+                course_status_key,
+                _final_widget_default(
+                    key_suffix,
+                    course_status_key,
+                    "Core",
+                ),
+            )
+            if stored_course_status and stored_course_status not in course_status_options:
+                course_status_options.insert(0, str(stored_course_status))
             course_status = st.selectbox(
                 "Course status",
-                ["Core", "Elective", "Required"],
-                key=f"course_status_{key_suffix}",
+                course_status_options,
+                index=(
+                    course_status_options.index(stored_course_status)
+                    if stored_course_status in course_status_options
+                    else 0
+                ),
+                key=course_status_key,
             )
-            lecturers = st.text_input("Lecturer(s)", key=f"lecturers_{key_suffix}")
+            lecturers_key = f"lecturers_{key_suffix}"
+            lecturers = st.text_input(
+                "Lecturer(s)",
+                value=_final_widget_default(key_suffix, lecturers_key, ""),
+                key=lecturers_key,
+            )
+            identifier_heading_key = (
+                f"identifier_heading_{key_suffix}_{identifier_column}"
+            )
             identifier_heading = st.text_input(
                 "Identifier heading in the workbook",
-                value=str(identifier_column),
-                key=f"identifier_heading_{key_suffix}_{identifier_column}",
+                value=_final_widget_default(
+                    key_suffix,
+                    identifier_heading_key,
+                    str(identifier_column),
+                ),
+                key=identifier_heading_key,
             )
+        remarks_key = f"remarks_{key_suffix}"
         remarks = st.text_area(
             "Lecturer's remarks",
-            key=f"remarks_{key_suffix}",
+            value=_final_widget_default(key_suffix, remarks_key, ""),
+            key=remarks_key,
             placeholder="Optional",
         )
 
     st.markdown('<div class="step-label">STEP 3 · REVIEW SCORE AND GRADE RULES</div>', unsafe_allow_html=True)
     st.subheader("Set the maximum scores and grading scale")
     score_settings = st.columns(3)
+    max_ca_key = f"max_ca_{key_suffix}"
     maximum_ca_score = float(
         score_settings[0].number_input(
             "Maximum CA score",
             min_value=0.0,
             max_value=1_000.0,
-            value=30.0,
+            value=_final_widget_default(key_suffix, max_ca_key, 30.0),
             step=1.0,
-            key=f"max_ca_{key_suffix}",
+            key=max_ca_key,
         )
     )
+    max_exam_key = f"max_exam_{key_suffix}"
     maximum_exam_score = float(
         score_settings[1].number_input(
             "Maximum exam score",
             min_value=0.0,
             max_value=1_000.0,
-            value=70.0,
+            value=_final_widget_default(key_suffix, max_exam_key, 70.0),
             step=1.0,
-            key=f"max_exam_{key_suffix}",
+            key=max_exam_key,
         )
     )
+    pass_mark_key = f"pass_mark_{key_suffix}"
     pass_mark = float(
         score_settings[2].number_input(
             "Pass mark",
             min_value=0.0,
             max_value=1_000.0,
-            value=40.0,
+            value=_final_widget_default(key_suffix, pass_mark_key, 40.0),
             step=1.0,
-            key=f"pass_mark_{key_suffix}",
+            key=pass_mark_key,
         )
     )
 
@@ -624,7 +885,11 @@ def render_final_result_page() -> None:
                     f"{grade} minimum",
                     min_value=0.0,
                     max_value=1_000.0,
-                    value=threshold_defaults[index],
+                    value=_final_widget_default(
+                        key_suffix,
+                        f"grade_{grade.lower()}_{key_suffix}",
+                        threshold_defaults[index],
+                    ),
                     step=1.0,
                     key=f"grade_{grade.lower()}_{key_suffix}",
                 )
@@ -671,10 +936,15 @@ def render_final_result_page() -> None:
             "and an editable Settings worksheet."
         )
     with final_controls[1]:
+        final_filename_key = f"final_filename_{key_suffix}"
         final_filename = st.text_input(
             "Final-result filename",
-            value="final_result.xlsx",
-            key=f"final_filename_{key_suffix}",
+            value=_final_widget_default(
+                key_suffix,
+                final_filename_key,
+                "final_result.xlsx",
+            ),
+            key=final_filename_key,
         )
 
     fingerprint = _final_result_fingerprint(
@@ -700,10 +970,13 @@ def render_final_result_page() -> None:
                     details,
                 )
                 workbook = build_final_result_workbook(processed, details)
+            previous_generated = st.session_state.get("generated_final_result") or {}
+            editor_revision = int(previous_generated.get("editor_revision", 0)) + 1
             st.session_state["generated_final_result"] = {
                 "fingerprint": fingerprint,
                 "processed": processed,
                 "workbook": workbook,
+                "editor_revision": editor_revision,
             }
         except ValueError as exc:
             st.error(str(exc))
@@ -713,6 +986,10 @@ def render_final_result_page() -> None:
         processed = final_generated["processed"]
         missing_ca_count = int(getattr(processed, "missing_ca_count", 0))
         missing_exam_count = int(getattr(processed, "missing_exam_count", 0))
+        notice_key = f"final_result_notice_{key_suffix}"
+        notice = st.session_state.pop(notice_key, None)
+        if notice:
+            st.success(str(notice))
         st.markdown("### Final result preview")
         metrics = st.columns(4)
         metrics[0].metric("Records", f"{processed.total_count:,}")
@@ -731,11 +1008,168 @@ def render_final_result_page() -> None:
                 f"{processed.invalid_exam_count:,} exam values were outside the allowed "
                 "range or were not numeric. They are marked incomplete."
             )
-        st.dataframe(
-            final_result_style(processed.dataframe),
-            use_container_width=True,
-            height=420,
+        st.markdown("### Review and edit scores")
+        st.caption(
+            "Correct CA or Exam values below, then select Apply score edits. "
+            "Calculated columns are locked and will update automatically."
         )
+        editor_revision = int(final_generated.get("editor_revision", 0))
+        editable_columns = {"CA Score", "Exam Score"}
+        locked_columns = [
+            column
+            for column in processed.dataframe.columns
+            if column not in editable_columns
+        ]
+        edited_dataframe = st.data_editor(
+            processed.dataframe,
+            key=f"final_score_editor_{key_suffix}_{editor_revision}",
+            use_container_width=True,
+            height=460,
+            hide_index=True,
+            num_rows="fixed",
+            disabled=locked_columns,
+            column_config={
+                "CA Score": st.column_config.NumberColumn(
+                    "CA Score",
+                    min_value=0.0,
+                    max_value=float(details.maximum_ca_score),
+                    step=0.5,
+                ),
+                "Exam Score": st.column_config.NumberColumn(
+                    "Exam Score",
+                    min_value=0.0,
+                    max_value=float(details.maximum_exam_score),
+                    step=0.5,
+                ),
+            },
+        )
+        pending_score_edits = _score_edit_fingerprint(
+            edited_dataframe
+        ) != _score_edit_fingerprint(processed.dataframe)
+        if pending_score_edits:
+            st.warning(
+                "Score edits have not been applied. Apply them before downloading "
+                "the final workbook."
+            )
+        if st.button(
+            "Apply score edits",
+            type="primary",
+            use_container_width=True,
+            disabled=not pending_score_edits,
+            key=f"apply_score_edits_{key_suffix}_{editor_revision}",
+        ):
+            try:
+                with st.spinner("Recalculating the final result and workbook…"):
+                    editable_input = edited_dataframe.copy()
+                    for score_column in ["CA Score", "Exam Score"]:
+                        editable_input[score_column] = editable_input[
+                            score_column
+                        ].astype("object")
+                    processed = prepare_edited_final_result(editable_input, details)
+                    workbook = build_final_result_workbook(processed, details)
+                st.session_state["generated_final_result"] = {
+                    "fingerprint": fingerprint,
+                    "processed": processed,
+                    "workbook": workbook,
+                    "editor_revision": editor_revision + 1,
+                }
+                st.session_state[notice_key] = (
+                    "Score edits applied and the final workbook was recalculated."
+                )
+                st.rerun()
+            except (TypeError, ValueError) as exc:
+                st.error(str(exc))
+
+        with st.expander("Add marks in bulk", expanded=False):
+            st.caption(
+                "Add the same number of marks to CA or Exam for one grade group "
+                "or every eligible record. Scores are capped at their configured maximum."
+            )
+            bulk_columns = st.columns(3)
+            with bulk_columns[0]:
+                bulk_score_column = st.selectbox(
+                    "Score to adjust",
+                    ["CA Score", "Exam Score"],
+                    key=f"bulk_score_column_{key_suffix}_{editor_revision}",
+                )
+            with bulk_columns[1]:
+                bulk_scope = st.selectbox(
+                    "Apply to",
+                    ["All records"] + [f"Grade {grade}" for grade in "ABCDEF"],
+                    key=f"bulk_scope_{key_suffix}_{editor_revision}",
+                )
+            with bulk_columns[2]:
+                bulk_amount = float(
+                    st.number_input(
+                        "Marks to add",
+                        min_value=0.0,
+                        value=0.0,
+                        step=0.5,
+                        key=f"bulk_amount_{key_suffix}_{editor_revision}",
+                    )
+                )
+            include_missing = st.checkbox(
+                "Include records where this score was missing",
+                value=False,
+                help=(
+                    "When selected, a missing score starts from 0 and the missing "
+                    "status is cleared after marks are added. Invalid scores are skipped."
+                ),
+                key=f"bulk_include_missing_{key_suffix}_{editor_revision}",
+            )
+            selected_grade = (
+                None if bulk_scope == "All records" else bulk_scope.removeprefix("Grade ")
+            )
+            bulk_preview = processed
+            affected_records = 0
+            if bulk_amount > 0:
+                try:
+                    bulk_preview, affected_records = apply_bulk_score_adjustment(
+                        processed,
+                        details,
+                        bulk_score_column,
+                        bulk_amount,
+                        grade_letter=selected_grade,
+                        include_missing=include_missing,
+                    )
+                except ValueError as exc:
+                    st.error(str(exc))
+            scope_description = selected_grade or "all grades"
+            st.caption(
+                f"{affected_records:,} record(s) will change for {scope_description}. "
+                "Records already at the maximum and invalid target scores are skipped."
+            )
+            if pending_score_edits:
+                st.info("Apply the individual score edits before using a bulk adjustment.")
+            if st.button(
+                "Apply bulk adjustment",
+                type="primary",
+                use_container_width=True,
+                disabled=(
+                    pending_score_edits
+                    or bulk_amount <= 0
+                    or affected_records == 0
+                ),
+                key=f"apply_bulk_adjustment_{key_suffix}_{editor_revision}",
+            ):
+                try:
+                    with st.spinner("Applying marks and rebuilding the workbook…"):
+                        workbook = build_final_result_workbook(bulk_preview, details)
+                    st.session_state["generated_final_result"] = {
+                        "fingerprint": fingerprint,
+                        "processed": bulk_preview,
+                        "workbook": workbook,
+                        "editor_revision": editor_revision + 1,
+                    }
+                    st.session_state[notice_key] = (
+                        f"Added {bulk_amount:g} mark(s) to {bulk_score_column} for "
+                        f"{affected_records:,} record(s)."
+                    )
+                    st.rerun()
+                except (TypeError, ValueError) as exc:
+                    st.error(str(exc))
+
+        st.markdown("### Grade distribution")
         grade_frame = pd.DataFrame(
             {
                 "Grade": list(processed.grade_counts),
@@ -750,6 +1184,12 @@ def render_final_result_page() -> None:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary",
             use_container_width=True,
+            disabled=pending_score_edits,
+            help=(
+                "Apply the pending score edits before downloading."
+                if pending_score_edits
+                else "Download the recalculated final-result workbook."
+            ),
         )
     elif final_generated:
         st.info("The final-result settings changed. Create the workbook again to refresh it.")
@@ -771,6 +1211,137 @@ def main() -> None:
         """,
         unsafe_allow_html=True,
     )
+
+    with st.expander("Update an existing result workbook", expanded=False):
+        st.caption(
+            "Upload any Excel result workbook to correct scores, apply bulk marks, "
+            "and download it in the final-result format. Workbooks created by this "
+            "app restore their saved settings automatically."
+        )
+        existing_upload = st.file_uploader(
+            "Upload an existing result workbook",
+            type=["xlsx", "xlsm", "xls"],
+            key="existing_final_result_upload",
+        )
+        if existing_upload is not None:
+            existing_content = existing_upload.getvalue()
+            try:
+                imported = cached_final_result_import(existing_content)
+            except FinalResultWorkbookError:
+                st.info(
+                    "This workbook was not created by this app. Choose the worksheet "
+                    "and header row below, then map its result columns."
+                )
+                try:
+                    existing_sheet_names = cached_sheet_names(
+                        existing_content,
+                        existing_upload.name,
+                    )
+                except WorkbookReadError as exc:
+                    st.error(str(exc))
+                else:
+                    existing_fingerprint = file_fingerprint(existing_content)
+                    import_controls = st.columns([2, 1])
+                    with import_controls[0]:
+                        existing_sheet_name = st.selectbox(
+                            "Result worksheet",
+                            existing_sheet_names,
+                            key=f"existing_sheet_{existing_fingerprint}",
+                        )
+                    with import_controls[1]:
+                        existing_header_row = int(
+                            st.number_input(
+                                "Result header row",
+                                min_value=1,
+                                max_value=100,
+                                value=1,
+                                step=1,
+                                key=(
+                                    f"existing_header_{existing_fingerprint}_"
+                                    f"{existing_sheet_name}"
+                                ),
+                                help=(
+                                    "Select the row containing the student identifier, "
+                                    "CA, and Exam column names."
+                                ),
+                            )
+                        )
+                    try:
+                        with st.spinner(
+                            f"Streaming cells from {existing_sheet_name}…"
+                        ):
+                            existing_loaded = cached_sheet(
+                                existing_content,
+                                existing_upload.name,
+                                existing_sheet_name,
+                                existing_header_row,
+                            )
+                            existing_report = cached_quality(existing_loaded)
+                    except WorkbookReadError as exc:
+                        st.error(str(exc))
+                    else:
+                        existing_dataframe = existing_loaded.dataframe
+                        if existing_dataframe.empty or not len(
+                            existing_dataframe.columns
+                        ):
+                            st.error(
+                                "This worksheet has no data rows or usable columns "
+                                "below the selected header."
+                            )
+                        else:
+                            st.dataframe(
+                                style_preview(existing_dataframe, existing_report),
+                                use_container_width=True,
+                                height=280,
+                            )
+                            if len(existing_dataframe) > 200:
+                                st.caption(
+                                    "Previewing the first 200 of "
+                                    f"{len(existing_dataframe):,} rows."
+                                )
+                            render_quality_summary(existing_report)
+                            if len(existing_dataframe.columns) < 3:
+                                st.error(
+                                    "Select a worksheet with at least three columns "
+                                    "for the identifier, CA score, and Exam score."
+                                )
+                            elif st.button(
+                                "Open worksheet and map result columns",
+                                type="primary",
+                                use_container_width=True,
+                                key=(
+                                    f"open_existing_source_{existing_fingerprint}_"
+                                    f"{existing_sheet_name}_{existing_header_row}"
+                                ),
+                            ):
+                                _open_existing_source_for_mapping(
+                                    existing_loaded,
+                                    existing_content,
+                                )
+                                st.rerun()
+            else:
+                import_metrics = st.columns(3)
+                import_metrics[0].metric(
+                    "Records", f"{imported.processed.total_count:,}"
+                )
+                import_metrics[1].metric(
+                    "Incomplete", f"{imported.processed.incomplete_count:,}"
+                )
+                import_metrics[2].metric(
+                    "Course", imported.details.course_code or "Not provided"
+                )
+                if st.button(
+                    "Open final result for editing",
+                    type="primary",
+                    use_container_width=True,
+                    key="open_existing_final_result",
+                ):
+                    _open_imported_final_result(
+                        imported,
+                        existing_content,
+                        existing_upload.name,
+                    )
+                    st.rerun()
 
     st.markdown('<div class="step-label">STEP 1 · ADD FILES</div>', unsafe_allow_html=True)
     heading, count_control = st.columns([3, 1])

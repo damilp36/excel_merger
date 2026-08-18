@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from io import BytesIO
 import math
 from typing import Any
+from zipfile import BadZipFile
 
 import pandas as pd
 from openpyxl import Workbook, load_workbook
@@ -19,6 +20,8 @@ from openpyxl.chart.label import DataLabelList
 from openpyxl.chart.shapes import GraphicalProperties
 from openpyxl.formatting.rule import FormulaRule
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils.cell import range_boundaries
+from openpyxl.utils.exceptions import InvalidFileException
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
 from .quality import is_missing
@@ -143,6 +146,17 @@ class ProcessedFinalResult:
     @property
     def pass_rate(self) -> float:
         return self.pass_count / self.complete_count if self.complete_count else 0.0
+
+
+@dataclass
+class ImportedFinalResult:
+    details: FinalResultDetails
+    processed: ProcessedFinalResult
+    source_dataframe: pd.DataFrame
+
+
+class FinalResultWorkbookError(ValueError):
+    """Raised when an uploaded workbook is not a generated final result."""
 
 
 def _clean_identifier(value: Any) -> str | None:
@@ -277,6 +291,261 @@ def prepare_final_result(
         invalid_ca_count=int(invalid_ca.sum()),
         invalid_exam_count=int(invalid_exam.sum()),
     )
+
+
+def prepare_edited_final_result(
+    edited_dataframe: pd.DataFrame,
+    details: FinalResultDetails,
+) -> ProcessedFinalResult:
+    """Recalculate a final result after CA or Exam values are edited."""
+
+    identifier_column = details.identifier_heading.strip()
+    required_columns = [identifier_column, "CA Score", "Exam Score"]
+    missing_columns = [
+        column for column in required_columns if column not in edited_dataframe.columns
+    ]
+    if missing_columns:
+        raise ValueError(
+            "The editable result is missing required columns: "
+            + ", ".join(missing_columns)
+        )
+
+    editable_source = edited_dataframe.copy()
+    for score_column in ["CA Score", "Exam Score"]:
+        editable_source[score_column] = editable_source[score_column].astype("object")
+    if "Student Status" in editable_source.columns:
+        for row_index, status_value in editable_source["Student Status"].items():
+            status = str(status_value)
+            for score_column, score_name, maximum_score in [
+                ("CA Score", "CA", details.maximum_ca_score),
+                ("Exam Score", "Exam", details.maximum_exam_score),
+            ]:
+                value = editable_source.at[row_index, score_column]
+                missing_issue = _status_has_score_issue(
+                    status, "Missing", score_name
+                )
+                invalid_issue = _status_has_score_issue(
+                    status, "Invalid", score_name
+                )
+                if missing_issue and not is_missing(value):
+                    try:
+                        still_placeholder_zero = float(value) == 0
+                    except (TypeError, ValueError):
+                        still_placeholder_zero = False
+                    if still_placeholder_zero:
+                        editable_source.at[row_index, score_column] = None
+                elif invalid_issue and is_missing(value):
+                    # A numeric out-of-range marker preserves the invalid state
+                    # without inserting text into a numeric score column.
+                    editable_source.at[row_index, score_column] = maximum_score + 1
+
+    return prepare_final_result(
+        editable_source,
+        identifier_column,
+        "CA Score",
+        "Exam Score",
+        details,
+    )
+
+
+def _status_has_score_issue(status: str, issue: str, score_name: str) -> bool:
+    return (
+        f"{issue} {score_name}" in status
+        or (score_name == "Exam" and f"{issue} CA and Exam" in status)
+    )
+
+
+def apply_bulk_score_adjustment(
+    processed: ProcessedFinalResult,
+    details: FinalResultDetails,
+    score_column: str,
+    amount: float,
+    grade_letter: str | None = None,
+    include_missing: bool = False,
+) -> tuple[ProcessedFinalResult, int]:
+    """Add marks to one score column for a grade group or all records."""
+
+    if score_column not in {"CA Score", "Exam Score"}:
+        raise ValueError("Bulk adjustments can only be applied to CA or Exam scores.")
+    if amount < 0:
+        raise ValueError("The number of marks to add cannot be negative.")
+    if grade_letter is not None and grade_letter not in set("ABCDEF"):
+        raise ValueError("The selected grade group must be A, B, C, D, E, or F.")
+
+    edited = processed.dataframe.copy()
+    current_scores = pd.to_numeric(edited[score_column], errors="coerce")
+    eligible = current_scores.notna()
+    if grade_letter is not None:
+        eligible &= edited["Grade Letter"].eq(grade_letter)
+
+    score_name = "CA" if score_column == "CA Score" else "Exam"
+    if not include_missing:
+        missing_target = edited["Student Status"].map(
+            lambda status: _status_has_score_issue(
+                str(status), "Missing", score_name
+            )
+        )
+        eligible &= ~missing_target
+
+    maximum = (
+        details.maximum_ca_score
+        if score_column == "CA Score"
+        else details.maximum_exam_score
+    )
+    adjusted_scores = (current_scores + float(amount)).clip(upper=maximum)
+    changed = eligible & adjusted_scores.ne(current_scores)
+    edited.loc[changed, score_column] = adjusted_scores.loc[changed]
+    return prepare_edited_final_result(edited, details), int(changed.sum())
+
+
+def import_final_result_workbook(content: bytes) -> ImportedFinalResult:
+    """Load a workbook previously created by the final-result exporter."""
+
+    try:
+        workbook = load_workbook(BytesIO(content), data_only=False)
+    except (BadZipFile, InvalidFileException, OSError, ValueError) as exc:
+        raise FinalResultWorkbookError(
+            "The uploaded file is not a readable Excel workbook."
+        ) from exc
+
+    try:
+        required_sheets = {"Final Result", "Settings"}
+        if not required_sheets.issubset(workbook.sheetnames):
+            raise FinalResultWorkbookError(
+                "This is not a generated final-result workbook. It must contain "
+                "Final Result and Settings worksheets."
+            )
+
+        result = workbook["Final Result"]
+        settings = workbook["Settings"]
+        expected_headers = {
+            "A39": "S/No.",
+            "C39": "CA Score",
+            "D39": "Exam Score",
+            "E39": "Grand Total",
+            "F39": "Grade Letter",
+            "G39": "Grade Point",
+            "H39": "Student Status",
+        }
+        incorrect_headers = [
+            cell_ref
+            for cell_ref, expected in expected_headers.items()
+            if result[cell_ref].value != expected
+        ]
+        identifier_heading = str(result["B39"].value or "").strip()
+        if incorrect_headers or not identifier_heading:
+            raise FinalResultWorkbookError(
+                "The Final Result worksheet does not have the expected result table."
+            )
+
+        def setting_text(cell_ref: str) -> str:
+            value = settings[cell_ref].value
+            return "" if value is None else str(value)
+
+        def setting_number(cell_ref: str, label: str) -> float:
+            value = settings[cell_ref].value
+            try:
+                return float(value)
+            except (TypeError, ValueError) as exc:
+                raise FinalResultWorkbookError(
+                    f"The Settings worksheet has an invalid {label}."
+                ) from exc
+
+        credit_units_value = setting_number("B8", "credit-unit value")
+        if not credit_units_value.is_integer():
+            raise FinalResultWorkbookError(
+                "The Settings worksheet credit-unit value must be a whole number."
+            )
+        details = FinalResultDetails(
+            programme=setting_text("B3"),
+            session=setting_text("B4"),
+            semester=setting_text("B5"),
+            course_code=setting_text("B6"),
+            course_title=setting_text("B7"),
+            credit_units=int(credit_units_value),
+            course_status=setting_text("B9"),
+            lecturers=setting_text("B10"),
+            remarks=setting_text("B11"),
+            identifier_heading=identifier_heading,
+            maximum_ca_score=setting_number("B14", "maximum CA score"),
+            maximum_exam_score=setting_number("B15", "maximum Exam score"),
+            grade_scale=GradeScale(
+                a_minimum=setting_number("B20", "A-grade minimum"),
+                b_minimum=setting_number("B21", "B-grade minimum"),
+                c_minimum=setting_number("B22", "C-grade minimum"),
+                d_minimum=setting_number("B23", "D-grade minimum"),
+                e_minimum=setting_number("B24", "E-grade minimum"),
+                pass_mark=setting_number("B16", "pass mark"),
+            ),
+        )
+        validation_errors = details.validation_errors()
+        if validation_errors:
+            raise FinalResultWorkbookError(" ".join(validation_errors))
+
+        if "FinalResultTable" in result.tables:
+            _, _, _, data_end = range_boundaries(
+                result.tables["FinalResultTable"].ref
+            )
+        else:
+            data_end = result.max_row
+        if data_end < 40:
+            raise FinalResultWorkbookError(
+                "The Final Result worksheet does not contain any result records."
+            )
+
+        identifiers: list[Any] = []
+        ca_values: list[Any] = []
+        exam_values: list[Any] = []
+        for row_number in range(40, data_end + 1):
+            identifier = result.cell(row_number, 2).value
+            ca_value = result.cell(row_number, 3).value
+            exam_value = result.cell(row_number, 4).value
+            status = str(result.cell(row_number, 8).value or "")
+            if all(is_missing(value) for value in [identifier, ca_value, exam_value]):
+                continue
+            if _status_has_score_issue(status, "Missing", "CA"):
+                ca_value = None
+            elif _status_has_score_issue(status, "Invalid", "CA"):
+                ca_value = details.maximum_ca_score + 1
+            if _status_has_score_issue(status, "Missing", "Exam"):
+                exam_value = None
+            elif _status_has_score_issue(status, "Invalid", "Exam"):
+                exam_value = details.maximum_exam_score + 1
+            identifiers.append(identifier)
+            ca_values.append(ca_value)
+            exam_values.append(exam_value)
+
+        source = pd.DataFrame(
+            {
+                identifier_heading: identifiers,
+                "CA Score": ca_values,
+                "Exam Score": exam_values,
+            }
+        )
+        if source.empty:
+            raise FinalResultWorkbookError(
+                "The Final Result worksheet does not contain any result records."
+            )
+        processed = prepare_final_result(
+            source,
+            identifier_heading,
+            "CA Score",
+            "Exam Score",
+            details,
+        )
+        return ImportedFinalResult(
+            details=details,
+            processed=processed,
+            source_dataframe=source,
+        )
+    except FinalResultWorkbookError:
+        raise
+    except (KeyError, TypeError, ValueError) as exc:
+        raise FinalResultWorkbookError(
+            "The uploaded workbook could not be read as a generated final result."
+        ) from exc
+    finally:
+        workbook.close()
 
 
 def _safe_excel_value(value: Any) -> Any:

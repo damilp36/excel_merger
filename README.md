@@ -14,30 +14,30 @@ a new Excel workbook for download.
 
 Suppose you have these two files:
 
-`CSC 402 CA RESULT.xlsx`
+`product_catalog.xlsx`
 
-| MATRIC NUMBER | CA SCORE |
+| SKU | PRODUCT NAME |
+| --- | --- |
+| SKU-1001 | Desk Lamp |
+| SKU-1002 | Office Chair |
+
+`warehouse_stock.xlsx`
+
+| SKU | UNITS IN STOCK |
 | --- | ---: |
-| 22/47CS/2244 | 18 |
-| 22/47CS/2245 | 16 |
+| SKU-1001 | 24 |
+| SKU-1002 | 11 |
 
-`CSC 402 EXAM RESULT.xlsx`
+To combine them, use the product catalog as the base table and select:
 
-| MATRIC NUMBER | EXAM SCORE |
-| --- | ---: |
-| 22/47CS/2244 | 21 |
-| 22/47CS/2245 | 30 |
+- Base lookup column: `SKU`
+- Base column to return: `PRODUCT NAME`
+- Lookup column in the stock file: `SKU`
+- Lookup column to return: `UNITS IN STOCK`
 
-To combine them, use the CA file as the base table and select:
-
-- Base lookup column: `MATRIC NUMBER`
-- Base column to return: `CA SCORE`
-- Lookup column in the exam file: `MATRIC NUMBER`
-- Lookup column to return: `EXAM SCORE`
-
-The resulting data will contain the matric number, CA score, exam score, and a
-match-status column. The status makes it easy to see which students were found
-in both files.
+The resulting data will contain the SKU, product name, available quantity, and
+a match-status column. The status makes it easy to see which products were
+found in both files.
 
 ## Main features
 
@@ -180,8 +180,8 @@ For every lookup workbook:
 4. Review or change the output column prefix.
 
 Prefixes show where returned values came from and prevent column-name
-collisions. For example, a prefix of `Exam` and a source column of `EXAM SCORE`
-produce an output column named `Exam.EXAM SCORE`.
+collisions. For example, a prefix of `Warehouse` and a source column of
+`UNITS IN STOCK` produce an output column named `Warehouse.UNITS IN STOCK`.
 
 ### 4. Review the data-quality preview
 
@@ -210,8 +210,8 @@ The app offers three key-normalization options.
 **Ignore surrounding spaces** removes spaces before and after a lookup value.
 It does not remove spaces from the middle of a value.
 
-**Ignore capitalization** treats values such as `22/47CS/2244` and
-`22/47cs/2244` as the same key.
+**Ignore capitalization** treats values such as `SKU-1001` and `sku-1001` as
+the same key.
 
 **Match numbers to numeric text** allows an Excel number such as `42` to match
 the text value `"42"`. Zero-padded identifiers remain distinct, so `0042` does
@@ -289,9 +289,9 @@ structure, header fixes, and a concise findings column.
 Every lookup source is matched against the key selected in the original base
 table. Lookup file 2 does not use a value returned by lookup file 1 as its key.
 
-For example, if three workbooks contain student details, CA scores, and exam
-scores, use the student-details workbook as the base and select the matric
-number as the common key in all three files.
+For example, if three workbooks contain a product catalog, warehouse stock, and
+supplier pricing, use the product catalog as the base and select the SKU as the
+common key in all three files.
 
 ## Data handling
 

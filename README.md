@@ -242,6 +242,53 @@ workbook** to save the result.
 The `.xlsx` extension is added automatically. Characters that are not valid in
 filenames are replaced safely.
 
+### 8. Continue to the final result page
+
+After the merged workbook is ready, select **Proceed to final result**. The app
+uses the merged data already held in the current session, so the downloaded
+workbook does not need to be uploaded again.
+
+On the final result page:
+
+1. Select the student identifier, CA score, and exam score columns.
+2. Enter the programme, session, semester, course code, course title, credit
+   units, course status, lecturer names, and optional remarks.
+3. Confirm the maximum CA and exam scores.
+4. Confirm the pass mark and grade boundaries.
+5. Create the final result workbook and review the calculated preview.
+6. Download the final result workbook using the filename you provide.
+
+Values that are missing, non-numeric, negative, or above the selected maximum
+score are treated as incomplete. They are not assigned a grade until corrected.
+
+## Understanding the final result workbook
+
+The final result download contains two worksheets.
+
+### Final Result
+
+This is the printable mark sheet. It includes:
+
+- Course and lecturer details
+- An executive summary of grades A through F
+- Grade counts and percentages
+- Pass, fail, and incomplete counts
+- Pass rate
+- A grade-distribution chart
+- Lecturer remarks
+- The complete result table
+
+The result table contains the serial number, selected student identifier, CA
+score, exam score, grand total, grade letter, grade point, and student status.
+Totals, grades, grade points, statuses, and summary values are Excel formulas.
+
+### Settings
+
+This sheet contains the details entered in the app and the grading rules used
+by the formulas. The cells remain editable. If a course detail, score limit,
+pass mark, or grade boundary is changed in Excel, the final result formulas are
+recalculated when the workbook is opened in a spreadsheet application.
+
 ## Understanding the output workbook
 
 The downloaded workbook contains three worksheets.
@@ -401,6 +448,7 @@ excel_merger/excel_io.py       Excel reading and header cleanup
 excel_merger/quality.py        Data-quality profiling and preview styling
 excel_merger/merge.py          Lookup-key normalization and merge logic
 excel_merger/exporter.py       Excel download generation
+excel_merger/final_result.py   Final-result calculations and workbook generation
 tests/                         Automated checks
 requirements.txt               Runtime dependencies
 requirements-dev.txt           Test dependencies

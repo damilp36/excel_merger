@@ -1,5 +1,9 @@
 from streamlit.testing.v1 import AppTest
 
+import pandas as pd
+
+from excel_merger.merge import MergeResult
+
 
 def test_initial_app_renders_and_file_count_controls_uploaders() -> None:
     app = AppTest.from_file("app.py", default_timeout=20).run()
@@ -36,3 +40,29 @@ render_quality_summary(analyze_quality(loaded))
 
     assert not app.exception
     assert app.success[0].value == "No obvious structural or cell-quality issues detected."
+
+
+def test_final_result_page_renders_from_generated_merge() -> None:
+    merged = pd.DataFrame(
+        {
+            "Student ID": ["S-1", "S-2"],
+            "CA Score": [20, 18],
+            "Exam.EXAM Score": [45, 36],
+            "Exam.Match status": ["Matched", "Matched"],
+        }
+    )
+    app = AppTest.from_file("app.py", default_timeout=20)
+    app.session_state["active_page"] = "final_result"
+    app.session_state["generated_lookup"] = {
+        "fingerprint": "test-fingerprint",
+        "result": MergeResult(merged, base_rows=2, base_key="Student ID"),
+        "workbook": b"test",
+    }
+    app.run()
+
+    assert not app.exception
+    assert "Choose the identifier and score fields" in [item.value for item in app.subheader]
+    assert len(app.selectbox) == 3
+    assert app.selectbox[0].value == "Student ID"
+    assert app.selectbox[1].value == "CA Score"
+    assert app.selectbox[2].value == "Exam.EXAM Score"

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import asdict
 from pathlib import Path
+import re
 from typing import Any
 
 import pandas as pd
@@ -12,6 +14,12 @@ import streamlit as st
 
 from excel_merger.excel_io import LoadedSheet, WorkbookReadError, list_sheet_names, stream_sheet
 from excel_merger.exporter import ExportLimitError, build_output_workbook, clean_output_filename
+from excel_merger.final_result import (
+    FinalResultDetails,
+    GradeScale,
+    build_final_result_workbook,
+    prepare_final_result,
+)
 from excel_merger.merge import LookupSpec, MatchOptions, default_prefix, merge_lookups
 from excel_merger.quality import QualityReport, analyze_quality, is_missing, style_preview
 
@@ -363,9 +371,354 @@ def render_result(generated: dict[str, Any], output_name: str) -> None:
         help="Includes Merged Data, Lookup Audit, and Data Quality worksheets.",
     )
 
+    st.markdown("### Prepare the final result")
+    st.caption(
+        "Continue with the merged data to calculate totals, grades, grade points, "
+        "status, and a course summary."
+    )
+    if st.button("Proceed to final result", width="stretch"):
+        st.session_state["active_page"] = "final_result"
+        st.session_state.pop("generated_final_result", None)
+        st.rerun()
+
+
+def _normalized_column_name(column: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(column).casefold()).strip()
+
+
+def _suggest_column(columns: list[str], phrases: list[str], fallback: int = 0) -> str:
+    if not columns:
+        raise ValueError("No columns are available for final-result processing.")
+    normalized = {column: _normalized_column_name(column) for column in columns}
+    for phrase in phrases:
+        expected = _normalized_column_name(phrase)
+        for column in columns:
+            if expected and expected in normalized[column]:
+                return column
+    return columns[min(fallback, len(columns) - 1)]
+
+
+def _final_result_fingerprint(
+    source_fingerprint: str,
+    identifier_column: str,
+    ca_column: str,
+    exam_column: str,
+    details: FinalResultDetails,
+) -> str:
+    payload = {
+        "source": source_fingerprint,
+        "identifier": identifier_column,
+        "ca": ca_column,
+        "exam": exam_column,
+        "details": asdict(details),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+def final_result_style(dataframe: pd.DataFrame) -> pd.io.formats.style.Styler:
+    preview = dataframe.head(200)
+    styles = pd.DataFrame("", index=preview.index, columns=preview.columns)
+    for row_index in preview.index:
+        for column in preview.columns:
+            value = preview.at[row_index, column]
+            if is_missing(value):
+                styles.at[row_index, column] = "background-color: #fee2e2; color: #991b1b"
+            elif column == "Student Status":
+                if value == "Pass":
+                    styles.at[row_index, column] = "background-color: #dcfce7; color: #166534"
+                elif value == "Fail":
+                    styles.at[row_index, column] = "background-color: #fee2e2; color: #991b1b"
+                else:
+                    styles.at[row_index, column] = "background-color: #fef3c7; color: #92400e"
+    return preview.style.apply(lambda _: styles, axis=None).format(na_rep="—")
+
+
+def render_final_result_page() -> None:
+    generated = st.session_state.get("generated_lookup")
+    if not generated:
+        st.error("Create a merged workbook before preparing a final result.")
+        if st.button("Return to lookup"):
+            st.session_state["active_page"] = "lookup"
+            st.rerun()
+        return
+
+    if st.button("Back to lookup and merge"):
+        st.session_state["active_page"] = "lookup"
+        st.rerun()
+
+    st.markdown(
+        """
+        <section class="hero">
+          <div class="eyebrow">FINAL RESULT</div>
+          <h1>Turn the merged scores into a complete mark sheet.</h1>
+          <p>Choose the score columns, enter the course details, review the grading
+          rules, and create an editable final-result workbook.</p>
+        </section>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    merged_dataframe = generated["result"].dataframe
+    source_fingerprint = str(generated.get("fingerprint", "current"))
+    key_suffix = source_fingerprint[:12]
+    columns = [str(column) for column in merged_dataframe.columns]
+    score_columns = [column for column in columns if not column.endswith(".Match status")]
+
+    st.markdown('<div class="step-label">STEP 1 · MAP RESULT COLUMNS</div>', unsafe_allow_html=True)
+    st.subheader("Choose the identifier and score fields")
+    identifier_suggestion = _suggest_column(
+        columns,
+        ["matric number", "student number", "student id", "identifier", "id"],
+    )
+    ca_suggestion = _suggest_column(
+        score_columns,
+        ["ca score", "continuous assessment", "test score", "assessment score"],
+        fallback=1,
+    )
+    exam_suggestion = _suggest_column(
+        score_columns,
+        ["exam score", "examination score", "final exam"],
+        fallback=2,
+    )
+    mapping_columns = st.columns(3)
+    with mapping_columns[0]:
+        identifier_column = st.selectbox(
+            "Student identifier column",
+            columns,
+            index=columns.index(identifier_suggestion),
+            key=f"final_identifier_{key_suffix}",
+        )
+    with mapping_columns[1]:
+        ca_column = st.selectbox(
+            "CA score column",
+            score_columns,
+            index=score_columns.index(ca_suggestion),
+            key=f"final_ca_{key_suffix}",
+        )
+    with mapping_columns[2]:
+        exam_column = st.selectbox(
+            "Exam score column",
+            score_columns,
+            index=score_columns.index(exam_suggestion),
+            key=f"final_exam_{key_suffix}",
+        )
+
+    st.markdown('<div class="step-label">STEP 2 · ENTER COURSE DETAILS</div>', unsafe_allow_html=True)
+    st.subheader("Add the information that belongs on the mark sheet")
+    with st.container(border=True):
+        detail_columns = st.columns(3)
+        with detail_columns[0]:
+            programme = st.text_input("Programme", key=f"programme_{key_suffix}")
+            session = st.text_input(
+                "Session",
+                placeholder="For example, 2025/2026",
+                key=f"session_{key_suffix}",
+            )
+            semester = st.text_input("Semester", key=f"semester_{key_suffix}")
+        with detail_columns[1]:
+            course_code = st.text_input("Course code", key=f"course_code_{key_suffix}")
+            course_title = st.text_input("Course title", key=f"course_title_{key_suffix}")
+            credit_units = int(
+                st.number_input(
+                    "Credit units",
+                    min_value=0,
+                    max_value=30,
+                    value=2,
+                    step=1,
+                    key=f"credit_units_{key_suffix}",
+                )
+            )
+        with detail_columns[2]:
+            course_status = st.text_input(
+                "Course status",
+                placeholder="For example, Core or Elective",
+                key=f"course_status_{key_suffix}",
+            )
+            lecturers = st.text_input("Lecturer(s)", key=f"lecturers_{key_suffix}")
+            identifier_heading = st.text_input(
+                "Identifier heading in the workbook",
+                value=str(identifier_column),
+                key=f"identifier_heading_{key_suffix}_{identifier_column}",
+            )
+        remarks = st.text_area(
+            "Lecturer's remarks",
+            key=f"remarks_{key_suffix}",
+            placeholder="Optional",
+        )
+
+    st.markdown('<div class="step-label">STEP 3 · REVIEW SCORE AND GRADE RULES</div>', unsafe_allow_html=True)
+    st.subheader("Set the maximum scores and grading scale")
+    score_settings = st.columns(3)
+    maximum_ca_score = float(
+        score_settings[0].number_input(
+            "Maximum CA score",
+            min_value=0.0,
+            max_value=1_000.0,
+            value=30.0,
+            step=1.0,
+            key=f"max_ca_{key_suffix}",
+        )
+    )
+    maximum_exam_score = float(
+        score_settings[1].number_input(
+            "Maximum exam score",
+            min_value=0.0,
+            max_value=1_000.0,
+            value=70.0,
+            step=1.0,
+            key=f"max_exam_{key_suffix}",
+        )
+    )
+    pass_mark = float(
+        score_settings[2].number_input(
+            "Pass mark",
+            min_value=0.0,
+            max_value=1_000.0,
+            value=40.0,
+            step=1.0,
+            key=f"pass_mark_{key_suffix}",
+        )
+    )
+
+    with st.expander("Grade boundaries", expanded=False):
+        st.caption("Enter the minimum grand total required for each grade.")
+        grade_columns = st.columns(5)
+        threshold_defaults = [70.0, 60.0, 50.0, 45.0, 40.0]
+        grade_letters = list("ABCDE")
+        thresholds = [
+            float(
+                grade_columns[index].number_input(
+                    f"{grade} minimum",
+                    min_value=0.0,
+                    max_value=1_000.0,
+                    value=threshold_defaults[index],
+                    step=1.0,
+                    key=f"grade_{grade.lower()}_{key_suffix}",
+                )
+            )
+            for index, grade in enumerate(grade_letters)
+        ]
+
+    scale = GradeScale(
+        a_minimum=thresholds[0],
+        b_minimum=thresholds[1],
+        c_minimum=thresholds[2],
+        d_minimum=thresholds[3],
+        e_minimum=thresholds[4],
+        pass_mark=pass_mark,
+    )
+    details = FinalResultDetails(
+        programme=programme,
+        session=session,
+        semester=semester,
+        course_code=course_code,
+        course_title=course_title,
+        credit_units=credit_units,
+        course_status=course_status,
+        lecturers=lecturers,
+        remarks=remarks,
+        identifier_heading=identifier_heading,
+        maximum_ca_score=maximum_ca_score,
+        maximum_exam_score=maximum_exam_score,
+        grade_scale=scale,
+    )
+    validation_errors = details.validation_errors()
+    if len({identifier_column, ca_column, exam_column}) != 3:
+        validation_errors.append(
+            "Student identifier, CA score, and exam score must use different columns."
+        )
+    for error in validation_errors:
+        st.warning(error)
+
+    st.markdown('<div class="step-label">STEP 4 · CREATE FINAL RESULT</div>', unsafe_allow_html=True)
+    final_controls = st.columns([2, 1])
+    with final_controls[0]:
+        st.caption(
+            "The final workbook includes an executive summary, grade chart, result table, "
+            "and an editable Settings worksheet."
+        )
+    with final_controls[1]:
+        final_filename = st.text_input(
+            "Final-result filename",
+            value="final_result.xlsx",
+            key=f"final_filename_{key_suffix}",
+        )
+
+    fingerprint = _final_result_fingerprint(
+        source_fingerprint,
+        identifier_column,
+        ca_column,
+        exam_column,
+        details,
+    )
+    if st.button(
+        "Create final result workbook",
+        type="primary",
+        width="stretch",
+        disabled=bool(validation_errors),
+    ):
+        try:
+            with st.spinner("Calculating grades and building the final workbook…"):
+                processed = prepare_final_result(
+                    merged_dataframe,
+                    identifier_column,
+                    ca_column,
+                    exam_column,
+                    details,
+                )
+                workbook = build_final_result_workbook(processed, details)
+            st.session_state["generated_final_result"] = {
+                "fingerprint": fingerprint,
+                "processed": processed,
+                "workbook": workbook,
+            }
+        except ValueError as exc:
+            st.error(str(exc))
+
+    final_generated = st.session_state.get("generated_final_result")
+    if final_generated and final_generated.get("fingerprint") == fingerprint:
+        processed = final_generated["processed"]
+        st.markdown("### Final result preview")
+        metrics = st.columns(4)
+        metrics[0].metric("Records", f"{processed.total_count:,}")
+        metrics[1].metric("Passes", f"{processed.pass_count:,}")
+        metrics[2].metric("Fails", f"{processed.fail_count:,}")
+        metrics[3].metric("Incomplete", f"{processed.incomplete_count:,}")
+        if processed.invalid_ca_count or processed.invalid_exam_count:
+            st.warning(
+                f"{processed.invalid_ca_count:,} CA values and "
+                f"{processed.invalid_exam_count:,} exam values were outside the allowed "
+                "range or were not numeric. They are marked incomplete."
+            )
+        st.dataframe(
+            final_result_style(processed.dataframe),
+            width="stretch",
+            height=420,
+        )
+        grade_frame = pd.DataFrame(
+            {
+                "Grade": list(processed.grade_counts),
+                "Count": list(processed.grade_counts.values()),
+            }
+        ).set_index("Grade")
+        st.bar_chart(grade_frame, height=260)
+        st.download_button(
+            "Download final result workbook",
+            data=final_generated["workbook"],
+            file_name=clean_output_filename(final_filename),
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary",
+            width="stretch",
+        )
+    elif final_generated:
+        st.info("The final-result settings changed. Create the workbook again to refresh it.")
+
 
 def main() -> None:
     inject_styles()
+    if st.session_state.get("active_page") == "final_result":
+        render_final_result_page()
+        return
     st.markdown(
         """
         <section class="hero">
